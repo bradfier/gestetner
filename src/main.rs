@@ -1,31 +1,46 @@
+use log::{debug, info};
 use rand::Rng;
-use std::fs::File;
+use std::fs::{DirEntry, File};
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::time::Duration;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+mod http;
 
 const HELP: &str = "\
 Gestetner - A netcat pastebin
 
 USAGE:
-  gestetner --listen 127.0.0.1:9999
+  gestetner -l '[::]:9999' -w '[::]:8080' -p /tmp/gst -u http://localhost:8080
 
 FLAGS:
   -h, --help            Prints help information
 
 OPTIONS:
+  -u URL            Set the base URL to be returned in paste responses
   -l HOST:PORT      Set the listening socket address for incoming pastes
   -p PATH           Set the filesystem path in which to store pastes
+  -w HOST:PORT      Set the listening socket for the HTTP server
+
+  -n LENGTH         Set the length of the random paste slug (default: 4)
+  -m MAX_SIZE       Set the maximum size of a paste in bytes (default: 512KiB)
+  --capacity SIZE   Set the maximum size of the paste directory (default: 100MiB)
 ";
 
-const MAX_PASTE: usize = 524_288; // 512KiB
+const DEFAULT_MAX_PASTE: usize = 524_288; // 512KiB
+const DEFAULT_MAX_CAPACITY: usize = 104_857_600; // 100MiB
 
 #[derive(Debug)]
 struct Args {
-    listen: std::net::SocketAddr,
+    url: String,
+    tcp_listen: std::net::SocketAddr,
+    http_listen: std::net::SocketAddr,
     file_path: PathBuf,
+    slug_length: usize,
+    max_paste_size: usize,
+    capacity: usize,
 }
 
 fn parse_args() -> Result<Args, pico_args::Error> {
@@ -37,8 +52,15 @@ fn parse_args() -> Result<Args, pico_args::Error> {
     }
 
     let args = Args {
-        listen: pargs.value_from_str("-l")?,
+        url: pargs.value_from_str("-u")?,
+        tcp_listen: pargs.value_from_str("-l")?,
+        http_listen: pargs.value_from_str("-w")?,
         file_path: pargs.value_from_str("-p")?,
+        slug_length: pargs.value_from_str("-n").unwrap_or(4),
+        max_paste_size: pargs.value_from_str("-m").unwrap_or(DEFAULT_MAX_PASTE),
+        capacity: pargs
+            .value_from_str("--capacity")
+            .unwrap_or(DEFAULT_MAX_CAPACITY),
     };
 
     Ok(args)
@@ -53,12 +75,50 @@ fn random_slug(l: usize) -> String {
     out
 }
 
+/// If the current directory size is bigger than `(capacity - new_file_size)`, delete the oldest files until there's room
+fn maybe_prune_oldest(path: &Path, new_file_size: u64, capacity: u64) {
+    let mut total: u64 = 0;
+    let mut files: Vec<DirEntry> = std::fs::read_dir(path)
+        .unwrap()
+        .filter_map(|f| f.ok())
+        .filter(|f| {
+            if let Ok(file_type) = f.file_type() {
+                file_type.is_file()
+            } else {
+                false
+            }
+        })
+        .filter(|f| f.metadata().is_ok())
+        .collect();
+
+    files.sort_by_key(|f| {
+        f.metadata()
+            .unwrap()
+            .created()
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    });
+    for f in files.iter() {
+        if let Ok(meta) = f.metadata() {
+            total += meta.len();
+        }
+    }
+
+    while (total + new_file_size) >= capacity {
+        let del = files.pop();
+        if let Some(del) = del {
+            debug!("Removing file {:?}", del.path());
+            total -= del.metadata().unwrap().len();
+            std::fs::remove_file(del.path()).expect("Failed to delete file");
+        }
+    }
+}
+
 fn handle_paste(args: Arc<Args>, stream: TcpStream) -> Result<(), std::io::Error> {
     let (mut tx, rx) = (stream.try_clone().unwrap(), stream);
     // Read at most MAX_PASTE into a buffer, we just return a connection reset if the client tries to send more than that
-    let mut buffer = Vec::with_capacity(MAX_PASTE);
+    let mut buffer = Vec::with_capacity(args.max_paste_size);
     rx.set_read_timeout(Some(Duration::new(1, 0)))?;
-    let read = rx.take(MAX_PASTE as u64).read_to_end(&mut buffer);
+    let read = rx.take(args.max_paste_size as u64).read_to_end(&mut buffer);
 
     if let Err(e) = read {
         if e.kind() != std::io::ErrorKind::WouldBlock {
@@ -70,11 +130,16 @@ fn handle_paste(args: Arc<Args>, stream: TcpStream) -> Result<(), std::io::Error
     let text = String::from_utf8(buffer);
     match text {
         Ok(ref t) => {
-            let slug = random_slug(4);
+            let slug = random_slug(args.slug_length);
             let mut path = args.file_path.clone();
             path.push(slug.clone());
+            maybe_prune_oldest(
+                &args.file_path,
+                t.as_bytes().len() as u64,
+                args.capacity as u64,
+            );
             File::create(path)?.write_all(t.as_bytes())?;
-            tx.write_all(format!("http://localhost:8080/{}\n", slug).as_bytes())?;
+            tx.write_all(format!("{}/{}\n", args.url, slug).as_bytes())?;
         }
         Err(_) => {
             tx.write_all(b"Failed to parse paste as UTF-8")?;
@@ -91,11 +156,18 @@ fn main() {
         std::process::exit(1);
     }
     let args = Arc::new(args.unwrap());
+    pretty_env_logger::init();
 
     // Create the storage directory if it doesn't exist
-    std::fs::create_dir_all(&args.file_path);
+    std::fs::create_dir_all(&args.file_path).expect("Failed to create pastes directory");
 
-    let socket = std::net::TcpListener::bind(args.listen).unwrap();
+    let http_args = args.clone();
+    std::thread::spawn(move || {
+        http::serve_pastes(http_args.http_listen, http_args.file_path.to_path_buf())
+    });
+
+    let socket = std::net::TcpListener::bind(args.tcp_listen).unwrap();
+    info!("Paste socket listening on {}", socket.local_addr().unwrap());
 
     for stream in socket.incoming() {
         match stream {
