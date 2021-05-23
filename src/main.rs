@@ -113,6 +113,19 @@ fn maybe_prune_oldest(path: &Path, new_file_size: u64, capacity: u64) {
     }
 }
 
+pub(crate) fn create_paste(args: &Args, content: String) -> Result<String, std::io::Error> {
+    let slug = random_slug(args.slug_length);
+    let mut path = args.file_path.clone();
+    path.push(slug.clone());
+    maybe_prune_oldest(
+        &args.file_path,
+        content.as_bytes().len() as u64,
+        args.capacity as u64,
+    );
+    File::create(path)?.write_all(content.as_bytes())?;
+    Ok(format!("{}/{}", args.url, slug))
+}
+
 fn handle_paste(args: Arc<Args>, stream: TcpStream) -> Result<(), std::io::Error> {
     let (mut tx, rx) = (stream.try_clone().unwrap(), stream);
     // Read at most MAX_PASTE into a buffer, we just return a connection reset if the client tries to send more than that
@@ -129,17 +142,14 @@ fn handle_paste(args: Arc<Args>, stream: TcpStream) -> Result<(), std::io::Error
     // Try and transform the buffer into a UTF-8 string and return an error to the client if that failed
     let text = String::from_utf8(buffer);
     match text {
-        Ok(ref t) => {
-            let slug = random_slug(args.slug_length);
-            let mut path = args.file_path.clone();
-            path.push(slug.clone());
-            maybe_prune_oldest(
-                &args.file_path,
-                t.as_bytes().len() as u64,
-                args.capacity as u64,
-            );
-            File::create(path)?.write_all(t.as_bytes())?;
-            tx.write_all(format!("{}/{}\n", args.url, slug).as_bytes())?;
+        Ok(t) => {
+            if !t.is_empty() {
+                let url = create_paste(&args, t)?;
+                tx.write_all(url.as_bytes())?;
+                tx.write_all(b"\n")?;
+            } else {
+                tx.write_all(b"No content")?;
+            }
         }
         Err(_) => {
             tx.write_all(b"Failed to parse paste as UTF-8")?;
@@ -162,9 +172,7 @@ fn main() {
     std::fs::create_dir_all(&args.file_path).expect("Failed to create pastes directory");
 
     let http_args = args.clone();
-    std::thread::spawn(move || {
-        http::serve_pastes(http_args.http_listen, http_args.file_path.to_path_buf())
-    });
+    std::thread::spawn(move || http::serve(http_args));
 
     let socket = std::net::TcpListener::bind(args.tcp_listen).unwrap();
     info!("Paste socket listening on {}", socket.local_addr().unwrap());
