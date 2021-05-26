@@ -1,5 +1,7 @@
 use log::{debug, info};
 use rand::Rng;
+use rouille::url::Url;
+use std::borrow::Cow;
 use std::fs::{DirEntry, File};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -10,7 +12,7 @@ use std::time::{Duration, SystemTime};
 mod http;
 
 const HELP: &str = "\
-Gestetner - A netcat pastebin
+Gestetner - A netcat & HTTP pastebin
 
 USAGE:
   gestetner -l '[::]:9999' -w '[::]:8080' -p /tmp/gst -u http://localhost:8080
@@ -41,6 +43,17 @@ struct Args {
     slug_length: usize,
     max_paste_size: usize,
     capacity: usize,
+}
+
+impl Args {
+    /// Try and guess the Host portion of the URL for use in the landing page
+    pub(crate) fn url_host(&self) -> Cow<str> {
+        if let Ok(url) = Url::parse(&self.url) {
+            Cow::Owned(url.host_str().unwrap_or(&self.url).to_string())
+        } else {
+            Cow::Borrowed(&self.url)
+        }
+    }
 }
 
 fn parse_args() -> Result<Args, pico_args::Error> {
