@@ -1,3 +1,4 @@
+use crate::raterlimiter::ClientRateLimiter;
 use crate::Args;
 use log::info;
 use rouille::{try_or_400, Response};
@@ -37,7 +38,7 @@ INSPIRED BY
     )
 }
 
-pub(crate) fn serve(args: Arc<Args>) {
+pub(crate) fn serve(args: Arc<Args>, limiter: Arc<ClientRateLimiter>) {
     info!("Starting HTTP server on {}", args.http_listen);
     rouille::start_server(args.http_listen, move |request| match request.method() {
         "GET" => {
@@ -52,6 +53,11 @@ pub(crate) fn serve(args: Arc<Args>) {
             }
         }
         "POST" => {
+            if limiter.check_key(&request.remote_addr().ip()).is_err() {
+                info!("Rate limited request from {}", &request.remote_addr().ip());
+                return Response::text("Rate limited\n").with_status_code(429);
+            }
+
             let content_length: Option<usize> = request
                 .header("Content-Length")
                 .and_then(|cl| cl.parse::<usize>().ok());

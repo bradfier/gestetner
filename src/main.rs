@@ -1,15 +1,20 @@
+use crate::raterlimiter::ClientRateLimiter;
+use governor::Quota;
 use log::{debug, info};
+use nonzero_ext::nonzero;
 use rand::Rng;
 use rouille::url::Url;
 use std::borrow::Cow;
 use std::fs::{DirEntry, File};
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 mod http;
+mod raterlimiter;
 
 const HELP: &str = "\
 Gestetner - A netcat & HTTP pastebin
@@ -28,6 +33,7 @@ OPTIONS:
 
   -n LENGTH         Set the length of the random paste slug (default: 4)
   -m MAX_SIZE       Set the maximum size of a paste in bytes (default: 512KiB)
+  -r RATE           Maximum number of pastes per minute from a single IP (default: 5)
   --capacity SIZE   Set the maximum size of the paste directory (default: 100MiB)
 ";
 
@@ -43,6 +49,7 @@ struct Args {
     slug_length: usize,
     max_paste_size: usize,
     capacity: usize,
+    rate: NonZeroU32,
 }
 
 impl Args {
@@ -74,6 +81,7 @@ fn parse_args() -> Result<Args, pico_args::Error> {
         capacity: pargs
             .value_from_str("--capacity")
             .unwrap_or(DEFAULT_MAX_CAPACITY),
+        rate: pargs.value_from_str("-r").unwrap_or(nonzero!(5u32)),
     };
 
     Ok(args)
@@ -139,8 +147,22 @@ pub(crate) fn create_paste(args: &Args, content: String) -> Result<String, std::
     Ok(format!("{}/{}", args.url, slug))
 }
 
-fn handle_paste(args: Arc<Args>, stream: TcpStream) -> Result<(), std::io::Error> {
+fn handle_paste(
+    args: Arc<Args>,
+    limiter: Arc<ClientRateLimiter>,
+    stream: TcpStream,
+) -> Result<(), std::io::Error> {
     let (mut tx, rx) = (stream.try_clone().unwrap(), stream);
+
+    if limiter.check_key(&rx.peer_addr().unwrap().ip()).is_err() {
+        info!(
+            "Rate limited request from {}",
+            &rx.peer_addr().unwrap().ip()
+        );
+        tx.write_all(b"Rate limited\n")?;
+        return Ok(());
+    }
+
     // Read at most MAX_PASTE into a buffer, we just return a connection reset if the client tries to send more than that
     let mut buffer = Vec::with_capacity(args.max_paste_size);
     rx.set_read_timeout(Some(Duration::new(1, 0)))?;
@@ -184,8 +206,14 @@ fn main() {
     // Create the storage directory if it doesn't exist
     std::fs::create_dir_all(&args.file_path).expect("Failed to create pastes directory");
 
+    // Initialise an empty rate limiter structure
+    let limiter = Arc::new(raterlimiter::ClientRateLimiter::new(Quota::per_minute(
+        args.rate,
+    )));
+
     let http_args = args.clone();
-    std::thread::spawn(move || http::serve(http_args));
+    let http_limiter = limiter.clone();
+    std::thread::spawn(move || http::serve(http_args, http_limiter));
 
     let socket = std::net::TcpListener::bind(args.tcp_listen).unwrap();
     info!("Paste socket listening on {}", socket.local_addr().unwrap());
@@ -194,7 +222,8 @@ fn main() {
         match stream {
             Ok(s) => {
                 let inner_args = args.clone();
-                std::thread::spawn(move || handle_paste(inner_args, s));
+                let inner_limiter = limiter.clone();
+                std::thread::spawn(move || handle_paste(inner_args, inner_limiter, s));
             }
             Err(e) => println!("Error connecting: {}", e),
         }
