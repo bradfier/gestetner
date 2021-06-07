@@ -1,7 +1,13 @@
 [package]
 name = "gestetner"
 version = "0.1.0"
+license = "AGPL-3.0"
 authors = ["Richard Bradfield <bradfier@fstab.me>"]
+repository = "https://github.com/bradfier/gestetner"
+homepage = "https://github.com/bradfier/gestetner"
+description = """
+A netcat & HTTP pastebin for your terminal.
+"""
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
