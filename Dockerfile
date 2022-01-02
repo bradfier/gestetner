@@ -15,7 +15,6 @@ RUN cargo build --release
 
 # Now build the _real_ Docker container, copying in the release binary
 FROM alpine:latest
-RUN apk --no-cache add ca-certificates
 COPY --from=builder \
     /home/rust/src/target/x86_64-unknown-linux-musl/release/gestetner \
     /usr/local/bin/
